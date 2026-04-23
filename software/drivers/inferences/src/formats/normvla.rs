@@ -17,8 +17,6 @@ struct FrameSkipStats {
     skipped_bus_ahead: u64,
     skipped_bus_large_diff: u64,
     skipped_motor_error: u64,
-    skipped_motor_ahead: u64,
-    skipped_motor_large_diff: u64,
     skipped_video_ahead: u64,
     skipped_video_large_diff: u64,
     skipped_no_images: u64,
@@ -27,7 +25,6 @@ struct FrameSkipStats {
     skipped_no_bus: u64,
     processed_frames: u64,
     max_bus_diff_ms: u64,
-    max_motor_diff_ms: u64,
     max_video_diff_ms: u64,
 }
 
@@ -52,7 +49,7 @@ impl FrameSkipStats {
         let skip_rate = ((self.total_frames - self.processed_frames) as f64 / self.total_frames as f64) * 100.0;
 
         log::info!(
-            "Frame stats (last {} frames): processed={}, skipped={} ({:.1}%), reasons: bus_ahead={}, bus_diff={}, motor_error={}, motor_ahead={}, motor_diff={}, video_ahead={}, video_diff={}, no_images={}, no_torque={}, invalid_range={}, no_bus={}; max_diffs: bus={}ms, motor={}ms, video={}ms",
+            "Frame stats (last {} frames): processed={}, skipped={} ({:.1}%), reasons: bus_ahead={}, bus_diff={}, motor_error={}, video_ahead={}, video_diff={}, no_images={}, no_torque={}, invalid_range={}, no_bus={}; max_diffs: bus={}ms, video={}ms",
             self.total_frames,
             self.processed_frames,
             self.total_frames - self.processed_frames,
@@ -60,8 +57,6 @@ impl FrameSkipStats {
             self.skipped_bus_ahead,
             self.skipped_bus_large_diff,
             self.skipped_motor_error,
-            self.skipped_motor_ahead,
-            self.skipped_motor_large_diff,
             self.skipped_video_ahead,
             self.skipped_video_large_diff,
             self.skipped_no_images,
@@ -69,7 +64,6 @@ impl FrameSkipStats {
             self.skipped_invalid_range,
             self.skipped_no_bus,
             self.max_bus_diff_ms,
-            self.max_motor_diff_ms,
             self.max_video_diff_ms,
         );
 
@@ -358,40 +352,6 @@ fn parse_joints(
                     bus_serial, motor.id
                 );
                 FRAME_STATS.lock().unwrap().skipped_motor_error += 1;
-                return None;
-            }
-
-            // Check motor timestamp - must not be ahead of inference timestamp
-            if motor.monotonic_stamp_ns > inference_stamp_ns {
-                log::info!(
-                    "Skip: motor_ahead (bus={} motor={} motor_stamp_ns={} inference_stamp_ns={} ahead_by_ms={})",
-                    bus_serial, motor.id, motor.monotonic_stamp_ns, inference_stamp_ns,
-                    (motor.monotonic_stamp_ns - inference_stamp_ns) / 1_000_000
-                );
-                FRAME_STATS.lock().unwrap().skipped_motor_ahead += 1;
-                return None;
-            }
-
-            // Check motor timestamp synchronization
-            let motor_stamp_diff = inference_stamp_ns - motor.monotonic_stamp_ns;
-            let motor_stamp_diff_ms = motor_stamp_diff / 1_000_000;
-
-            // Track max diff
-            {
-                let mut stats = FRAME_STATS.lock().unwrap();
-                if motor_stamp_diff_ms > stats.max_motor_diff_ms {
-                    stats.max_motor_diff_ms = motor_stamp_diff_ms;
-                }
-            }
-
-            if motor_stamp_diff > MAX_STAMP_DIFF_NS {
-                log::info!(
-                    "Skip: motor_diff (bus={} motor={} diff_ms={} limit_ms={} motor_stamp_ns={} inference_stamp_ns={})",
-                    bus_serial, motor.id, motor_stamp_diff_ms,
-                    MAX_STAMP_DIFF_NS / 1_000_000,
-                    motor.monotonic_stamp_ns, inference_stamp_ns
-                );
-                FRAME_STATS.lock().unwrap().skipped_motor_large_diff += 1;
                 return None;
             }
 
