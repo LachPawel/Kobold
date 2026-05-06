@@ -50,6 +50,7 @@ class BusReader:
         self.latest: st3215.InferenceStateReader | None = None
         self.latest_stamp_ns: int = 0
         self.frame_count: int = 0
+        self._last_entry_id: bytes = b""
         self._queue: asyncio.Queue = asyncio.Queue()
         self._error_queue = client.follow("st3215/inference", self._queue)
 
@@ -61,6 +62,10 @@ class BusReader:
             entry = await self._queue.get()
             if entry is None:
                 raise RuntimeError(f"[{self.label}] inference stream closed")
+            entry_id = bytes(entry.ID.ID)
+            if entry_id == self._last_entry_id:
+                continue
+            self._last_entry_id = entry_id
             try:
                 self.latest = st3215.InferenceStateReader(entry.Data)
                 self.latest_stamp_ns = time.monotonic_ns()
