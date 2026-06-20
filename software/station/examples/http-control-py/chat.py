@@ -23,6 +23,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import struct
 import time
@@ -54,6 +55,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger("chat")
 
 MODEL_ID = "gemini-robotics-er-1.6-preview"
+LOCATE_MODEL = os.getenv("LOCATE_MODEL", "gemini-2.5-flash")  # fast model used inside the servo loop
+SERVO_TOL = 70           # off-center distance (0-1000) that counts as "pointing at it"
+SERVO_MAX_ITERS = 14
+SERVO_GAIN = 0.14        # joint step (normalized) per unit of normalized image error
+SERVO_MAX_STEP = 0.09    # cap on a single iteration's joint move (normalized)
+SERVO_SETTLE = 0.7       # seconds to let the servo move + camera refresh between checks
+# Gemini Live (browser WebSocket voice agent)
+LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-09-2025")
+LIVE_SYSTEM = (
+    "You are the voice of a NormaCore robot arm with an eye-in-hand camera. You can SEE the live camera feed. "
+    "Answer questions about what you see naturally and briefly. When the user asks you to point at / look at / "
+    "find an object, call point_at with that object — it visually servos the arm until the object is centered. "
+    "Use move_joint for direct joint moves (the gripper is the highest motor id), replay_pose for saved poses, "
+    "set_torque to limp/stiffen the arm. Keep spoken replies short; narrate what you're doing as you move."
+)
+FUNC_DECLS = [
+    {"name": "point_at", "description": "Aim the camera/arm at a named object via closed-loop visual servoing until centered.",
+     "parameters": {"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}},
+    {"name": "move_joint", "description": "Move one joint to a normalized position (0=range min, 1=range max).",
+     "parameters": {"type": "object", "properties": {"motor_id": {"type": "integer"}, "normalized": {"type": "number"}}, "required": ["motor_id", "normalized"]}},
+    {"name": "replay_pose", "description": "Move the arm to a saved pose by name.",
+     "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "set_torque", "description": "Enable (stiffen) or disable (limp) the arm motors.",
+     "parameters": {"type": "object", "properties": {"enable": {"type": "boolean"}}, "required": ["enable"]}},
+]
 MOTOR_QUEUE = "st3215/inference"
 RAM_TORQUE_ENABLE, RAM_GOAL_POSITION, RAM_PRESENT_POSITION = 0x28, 0x2A, 0x38
 MAX_STEP, SIGN_BIT = 4095, 0x8000
@@ -75,7 +101,8 @@ class S:
     server = "localhost"
     want_bus = "auto"
     bus_serial = ""
-    base_motor = 1
+    base_motor = 1          # joint that pans the view left/right (image x)
+    tilt_motor = 0          # joint that tilts the view up/down (image y); 0 = disabled
     latest = None
     video_queue = ""
     jpeg: bytes | None = None
@@ -136,6 +163,13 @@ async def _replay(name: str):
     if writes:
         await send_commands(S.client, [_sync(RAM_GOAL_POSITION, writes)])
     return {"replayed": name}
+
+
+def _norm_of(mid: int) -> float:
+    """Current (actual, measured) joint position as 0..1 within its calibrated arc."""
+    m = _motors()[mid]
+    rmin, rmax = int(m.get_range_min()), int(m.get_range_max())
+    return (_present(bytes(m.get_state())) - rmin) / ((rmax - rmin) or 1)
 
 
 # --- background followers ---------------------------------------------------
@@ -267,6 +301,70 @@ def _system_context() -> str:
             f"gripper is usually the highest id). Saved poses: {poses or 'none'}.")
 
 
+async def _locate(target: str):
+    """Find `target` in the live frame; return its center (y, x) in 0-1000, or (None, None)."""
+    img = _frame_pil()
+    prompt = (f'Point to the {target}. Return ONLY JSON [{{"point":[y,x],"label":"..."}}], '
+              'y,x normalized 0-1000. If it is not visible, return [].')
+    cfg = types.GenerateContentConfig(temperature=0.0,
+                                      thinking_config=types.ThinkingConfig(thinking_budget=0))
+    try:
+        resp = await asyncio.to_thread(S.gemini.models.generate_content,
+                                       model=LOCATE_MODEL, contents=[img, prompt], config=cfg)
+        pts = json.loads(_parse_json(resp.text))
+        if pts and pts[0].get("point"):
+            y, x = pts[0]["point"]
+            return float(y), float(x)
+    except Exception:
+        logger.exception("locate failed")
+    return None, None
+
+
+async def _servo_to(target: str) -> str:
+    """Closed-loop visual servo: nudge joints to bring `target` to frame center.
+
+    Eye-in-hand, uncalibrated: the per-joint direction (sign) is unknown, so we
+    learn it online — if a move makes the object MORE off-center, we step back,
+    flip that joint's direction, and damp the gain. Repeats until centered.
+    """
+    axes = [("pan", S.base_motor, "x")]
+    if S.tilt_motor:
+        axes.append(("tilt", S.tilt_motor, "y"))
+    sign = {n: 1 for n, _, _ in axes}
+    gain = {n: SERVO_GAIN for n, _, _ in axes}
+    prev_abs = {n: None for n, _, _ in axes}
+    prev_pos = {n: None for n, _, _ in axes}
+    await _torque(True)
+    log = []
+    for i in range(SERVO_MAX_ITERS):
+        ty, tx = await _locate(target)
+        if ty is None:
+            log.append(f"step {i}: lost sight of '{target}'")
+            break
+        err = {"x": tx - 500.0, "y": ty - 500.0}
+        dist = math.hypot(err["x"], err["y"] if S.tilt_motor else 0.0)
+        log.append(f"step {i}: {target}@({int(tx)},{int(ty)}) off-center={int(dist)}")
+        if dist < SERVO_TOL:
+            log.append("centered ✓")
+            break
+        for name, mid, k in axes:
+            e = err[k]
+            cur = _norm_of(mid)
+            # Did the previous move on this axis make things worse? Step back + flip.
+            if prev_abs[name] is not None and abs(e) > prev_abs[name] + 15:
+                sign[name] *= -1
+                gain[name] = max(0.04, gain[name] * 0.6)
+                if prev_pos[name] is not None:
+                    await _move_norm({mid: prev_pos[name]})
+                    cur = prev_pos[name]
+                    log.append(f"  {name}: overshot — stepped back, reversed direction")
+            prev_abs[name], prev_pos[name] = abs(e), cur
+            delta = max(-SERVO_MAX_STEP, min(SERVO_MAX_STEP, sign[name] * gain[name] * (e / 500.0)))
+            await _move_norm({mid: max(0.0, min(1.0, cur + delta))})
+        await asyncio.sleep(SERVO_SETTLE)
+    return " | ".join(log)
+
+
 async def _exec_arm(arm: dict, points: list) -> str:
     t = (arm or {}).get("type", "none")
     if t == "none":
@@ -278,18 +376,33 @@ async def _exec_arm(arm: dict, points: list) -> str:
     if t == "replay_pose":
         return json.dumps(await _replay(arm["name"]))
     if t == "point_at":
-        # map the target's x-coordinate to base-joint rotation (no calibration needed)
-        x = None
-        for p in points or []:
-            if p.get("point"):
-                x = p["point"][1]
-                break
-        if x is None:
-            return "couldn't locate target to point at"
-        norm = max(0.0, min(1.0, x / 1000.0))
-        await _move_norm({S.base_motor: norm})
-        return f"rotated base toward x={x} (norm {norm:.2f})"
+        target = (arm.get("target") or "").strip()
+        if not target and points:
+            target = points[0].get("label", "")
+        if not target:
+            return "no target to point at"
+        return await _servo_to(target)
     return ""
+
+
+async def _run_tool(name: str, args: dict) -> str:
+    """Execute one Live tool call against the arm (shared by the web WS client and live.py)."""
+    try:
+        if name == "point_at":
+            return await _servo_to((args.get("target") or "").strip())
+        if name == "move_joint":
+            await _torque(True)
+            return f"moved joint {args['motor_id']} -> {await _move_norm({int(args['motor_id']): float(args['normalized'])})}"
+        if name == "replay_pose":
+            await _torque(True)
+            return json.dumps(await _replay(args["name"]))
+        if name == "set_torque":
+            await _torque(bool(args["enable"]))
+            return "torque " + ("enabled" if args["enable"] else "disabled (limp)")
+    except Exception as e:
+        logger.exception("tool %s failed", name)
+        return f"error: {e}"
+    return f"unknown tool {name}"
 
 
 async def chat_turn(message: str) -> dict:
@@ -379,6 +492,24 @@ async def chat(req: ChatReq):
         return {"reply": f"Error: {str(e)[:160]}", "points": [], "action": "error"}
 
 
+class ToolReq(BaseModel):
+    name: str
+    args: dict = {}
+
+
+@app.get("/api/live-config")
+async def live_config():
+    # localhost demo: hands the key to the browser so it can open the Live WS directly.
+    # For production, swap to ephemeral tokens (https://ai.google.dev/gemini-api/docs/ephemeral-tokens).
+    return {"apiKey": os.getenv("GEMINI_API_KEY", ""), "model": LIVE_MODEL,
+            "system": LIVE_SYSTEM, "decls": FUNC_DECLS}
+
+
+@app.post("/api/tool")
+async def api_tool(req: ToolReq):
+    return {"result": await _run_tool(req.name, req.args)}
+
+
 @app.post("/api/torque/{enable}")
 async def torque(enable: int):
     await _torque(bool(enable))
@@ -424,9 +555,10 @@ HTML = """<!doctype html><html><head><meta charset=utf-8><title>Norma Core · ER
  #bar{display:flex;gap:8px;padding:14px;border-top:1px solid #1b1f27}
  #inp{flex:1;background:#11151b;border:1px solid #2b303b;border-radius:10px;color:#fff;padding:11px 13px;font:inherit}
  h3{margin:0;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#8b93a1}
- #micbtn,#spkbtn{font-size:18px;line-height:1;width:44px}
+ #micbtn,#spkbtn,#livebtn{font-size:18px;line-height:1;width:44px}
  #micbtn.on{background:#c0392b;border-color:#e74c3c;animation:pulse 1.1s infinite}
  #spkbtn.on{background:#1e7d4f;border-color:#27ae60}
+ #livebtn.on{background:#1e7d4f;border-color:#27ae60;animation:pulse 1.1s infinite}
  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(231,76,60,.55)}50%{box-shadow:0 0 0 9px rgba(231,76,60,0)}}
 </style></head><body>
 <div id=left>
@@ -441,8 +573,9 @@ HTML = """<!doctype html><html><head><meta charset=utf-8><title>Norma Core · ER
 <div id=right>
  <div id=log><div class=msg bot>Hi! I can see through the arm's camera. Ask me what I see, or tell me to point at something.</div></div>
  <div id=bar>
-   <button id=micbtn onclick=micToggle() title="Click and speak (push to talk)">🎤</button>
-   <button id=spkbtn onclick=voiceToggle() title="Voice mode: speaks replies + keeps listening">🔊</button>
+   <button id=livebtn onclick=liveToggle() title="Native voice — Gemini Live over WebSocket">🎙</button>
+   <button id=micbtn onclick=micToggle() title="Push-to-talk (browser speech → text)">🎤</button>
+   <button id=spkbtn onclick=voiceToggle() title="Speak text replies + keep listening">🔊</button>
    <input id=inp placeholder="Speak or type — e.g. 'point at the laptop'" autofocus>
    <button onclick=send()>Send</button></div>
 </div>
@@ -491,6 +624,77 @@ function voiceToggle(){
 async function t(v){await fetch('/api/torque/'+v,{method:'POST'});add('act','⚙ torque '+(v?'ON':'OFF'));}
 async function rec(){const n=prompt('Pose name (e.g. left, center, right):');if(!n)return;
  await fetch('/api/record/'+encodeURIComponent(n),{method:'POST'});add('act','⚙ recorded pose "'+n+'"');}
+// --- Gemini Live (raw WebSocket): native bidirectional voice + video + tools ---
+const liveBtn=document.getElementById('livebtn');
+let lws=null,liveOn=false,micCtx=null,micProc=null,micStream=null,playCtx=null,playTime=0,frameTimer=null,curBot=null,curUser=null;
+function b64FromBytes(u8){let s='';const CH=0x8000;for(let i=0;i<u8.length;i+=CH)s+=String.fromCharCode.apply(null,u8.subarray(i,i+CH));return btoa(s);}
+function playPCM(b64){
+ const raw=atob(b64),u8=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)u8[i]=raw.charCodeAt(i);
+ const dv=new DataView(u8.buffer),n=u8.length>>1,f=new Float32Array(n);
+ for(let i=0;i<n;i++)f[i]=dv.getInt16(i*2,true)/32768;
+ const b=playCtx.createBuffer(1,n,24000);b.getChannelData(0).set(f);
+ const s=playCtx.createBufferSource();s.buffer=b;s.connect(playCtx.destination);
+ const now=playCtx.currentTime;if(playTime<now)playTime=now;s.start(playTime);playTime+=b.duration;}
+async function liveToggle(){
+ if(liveOn){stopLive();return;}
+ liveOn=true;liveBtn.classList.add('on');add('act','🎙 connecting Live…');
+ let cfg;try{cfg=await (await fetch('/api/live-config')).json();}catch(e){add('act','⚠ config: '+e);return stopLive();}
+ playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:24000});
+ lws=new WebSocket('wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key='+encodeURIComponent(cfg.apiKey));
+ lws.onopen=()=>lws.send(JSON.stringify({setup:{model:'models/'+cfg.model,generationConfig:{responseModalities:['AUDIO']},systemInstruction:{parts:[{text:cfg.system}]},tools:[{functionDeclarations:cfg.decls}],inputAudioTranscription:{},outputAudioTranscription:{}}}));
+ lws.onmessage=async(ev)=>{
+   let d=ev.data;if(d instanceof Blob)d=await d.text();const m=JSON.parse(d);
+   if(m.setupComplete){add('act','🎙 live — talk now (headphones recommended)');startMic();startFrames();return;}
+   const sc=m.serverContent;
+   if(sc){
+     if(sc.modelTurn&&sc.modelTurn.parts)for(const p of sc.modelTurn.parts){if(p.inlineData&&p.inlineData.data)playPCM(p.inlineData.data);}
+     if(sc.inputTranscription&&sc.inputTranscription.text){if(!curUser)curUser=add('me','');curUser.textContent+=sc.inputTranscription.text;}
+     if(sc.outputTranscription&&sc.outputTranscription.text){if(!curBot)curBot=add('bot','');curBot.textContent+=sc.outputTranscription.text;}
+     if(sc.turnComplete){curBot=null;curUser=null;}
+   }
+   if(m.toolCall){
+     const fr=[];
+     for(const fc of m.toolCall.functionCalls){
+       add('act','⚙ '+fc.name+' '+JSON.stringify(fc.args||{}));
+       let result='ok';
+       try{result=(await (await fetch('/api/tool',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:fc.name,args:fc.args||{}})})).json()).result;}catch(e){result='error';}
+       add('act','   → '+result);
+       fr.push({id:fc.id,name:fc.name,response:{result}});
+     }
+     lws.send(JSON.stringify({toolResponse:{functionResponses:fr}}));
+   }
+ };
+ lws.onerror=()=>add('act','⚠ live socket error');
+ lws.onclose=()=>{if(liveOn)add('act','live closed');};
+}
+async function startMic(){
+ micStream=await navigator.mediaDevices.getUserMedia({audio:true});
+ micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+ const src=micCtx.createMediaStreamSource(micStream);micProc=micCtx.createScriptProcessor(4096,1,1);
+ const mute=micCtx.createGain();mute.gain.value=0;src.connect(micProc);micProc.connect(mute);mute.connect(micCtx.destination);
+ micProc.onaudioprocess=(e)=>{
+   if(!lws||lws.readyState!==1)return;
+   const f=e.inputBuffer.getChannelData(0),i16=new Int16Array(f.length);
+   for(let i=0;i<f.length;i++){let s=Math.max(-1,Math.min(1,f[i]));i16[i]=s<0?s*32768:s*32767;}
+   lws.send(JSON.stringify({realtimeInput:{audio:{data:b64FromBytes(new Uint8Array(i16.buffer)),mimeType:'audio/pcm;rate=16000'}}}));
+ };
+}
+function startFrames(){
+ frameTimer=setInterval(async()=>{
+   if(!lws||lws.readyState!==1)return;
+   try{const ab=await (await fetch('/api/frame.jpg?t='+Date.now())).arrayBuffer();
+     lws.send(JSON.stringify({realtimeInput:{video:{data:b64FromBytes(new Uint8Array(ab)),mimeType:'image/jpeg'}}}));}catch(e){}
+ },1500);
+}
+function stopLive(){
+ liveOn=false;liveBtn.classList.remove('on');add('act','🎙 live off');
+ try{if(frameTimer)clearInterval(frameTimer);}catch(e){}
+ try{if(micProc)micProc.disconnect();}catch(e){}
+ try{if(micStream)micStream.getTracks().forEach(t=>t.stop());}catch(e){}
+ try{if(micCtx)micCtx.close();}catch(e){}
+ try{if(lws)lws.close();}catch(e){}
+ lws=null;curBot=null;curUser=null;
+}
 </script></body></html>"""
 
 
@@ -500,9 +704,11 @@ def main():
     p.add_argument("--bus-serial", default=os.getenv("BUS_SERIAL", "auto"))
     p.add_argument("--video-queue", default=os.getenv("VIDEO_QUEUE", ""))
     p.add_argument("--base-motor", type=int, default=int(os.getenv("BASE_MOTOR", "1")))
+    p.add_argument("--tilt-motor", type=int, default=int(os.getenv("TILT_MOTOR", "0")))
     p.add_argument("--port", type=int, default=8000)
     a = p.parse_args()
     S.server, S.want_bus, S.video_queue, S.base_motor = a.server, a.bus_serial, a.video_queue, a.base_motor
+    S.tilt_motor = a.tilt_motor
     uvicorn.run(app, host="0.0.0.0", port=a.port)
 
 
