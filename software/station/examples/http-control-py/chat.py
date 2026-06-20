@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import struct
 import time
 from contextlib import asynccontextmanager
@@ -56,21 +57,30 @@ logger = logging.getLogger("chat")
 
 MODEL_ID = "gemini-robotics-er-1.6-preview"
 LOCATE_MODEL = os.getenv("LOCATE_MODEL", "gemini-2.5-flash")  # fast model used inside the servo loop
-SERVO_TOL = 70           # off-center distance (0-1000) that counts as "pointing at it"
-SERVO_MAX_ITERS = 14
-SERVO_GAIN = 0.14        # joint step (normalized) per unit of normalized image error
-SERVO_MAX_STEP = 0.09    # cap on a single iteration's joint move (normalized)
+SERVO_MODEL = os.getenv("SERVO_MODEL", "gemini-robotics-er-1.6-preview")  # ER 1.6 = the vision brain
+SERVO_TOL = 70           # off-center distance (0-1000) = "aimed at it"
+CENTER_OK = 150          # "roughly in the middle" — center to here before reaching
+SERVO_MAX_ITERS = 28     # longer loop
+SERVO_GAIN = 0.08        # smaller = slower, smoother (was 0.13)
+SERVO_MAX_STEP = 0.06    # cap on a single iteration's joint move (normalized)
 SERVO_SETTLE = 0.7       # seconds to let the servo move + camera refresh between checks
+REACH_WEIGHT = 0.7       # how much "get closer" (grow on-screen size) matters vs centering
+REACH_SIZE_TARGET = 0.18 # stop once the target fills ~18% of the frame (close enough)
+GRIPPER_OPEN = float(os.getenv("GRIPPER_OPEN", "0.0"))   # normalized claw-open position (flip if reversed)
+GRIPPER_CLOSE = float(os.getenv("GRIPPER_CLOSE", "1.0"))  # normalized claw-closed position
 # Gemini Live (browser WebSocket voice agent)
-LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-09-2025")
+LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.1-flash-live-preview")
 LIVE_SYSTEM = (
-    "You are the voice of a NormaCore robot arm with an eye-in-hand camera. You can SEE the live camera feed. "
-    "Answer questions about what you see naturally and briefly. When the user asks you to point at / look at / "
-    "find an object, call point_at with that object — it visually servos the arm until the object is centered. "
-    "Use move_joint for direct joint moves (the gripper is the highest motor id), replay_pose for saved poses, "
-    "set_torque to limp/stiffen the arm. Keep spoken replies short; narrate what you're doing as you move."
+    "You are the voice of a NormaCore robot arm. You do NOT see the camera directly — the robot's vision is a "
+    "separate model (Gemini ER 1.6). To see the scene, call look(). To aim the arm at something, call "
+    "point_at(target) — it visually servos the arm until the object is centered. To pick something up call "
+    "grab(target) (opens the claw, reaches, closes); open_gripper/close_gripper control the claw directly. Use "
+    "move_joint for direct joint moves, replay_pose for saved poses, set_torque to limp/stiffen the arm. "
+    "Keep spoken replies short and conversational; narrate what you're doing as you move."
 )
 FUNC_DECLS = [
+    {"name": "look", "description": "Look through the robot's camera (Gemini ER 1.6) and describe what is visible. Call whenever the user asks what you see or to find/identify something.",
+     "parameters": {"type": "object", "properties": {}}},
     {"name": "point_at", "description": "Aim the camera/arm at a named object via closed-loop visual servoing until centered.",
      "parameters": {"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}},
     {"name": "move_joint", "description": "Move one joint to a normalized position (0=range min, 1=range max).",
@@ -79,6 +89,10 @@ FUNC_DECLS = [
      "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
     {"name": "set_torque", "description": "Enable (stiffen) or disable (limp) the arm motors.",
      "parameters": {"type": "object", "properties": {"enable": {"type": "boolean"}}, "required": ["enable"]}},
+    {"name": "open_gripper", "description": "Open the claw/gripper.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "close_gripper", "description": "Close the claw/gripper to hold an object.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "grab", "description": "Pick up an object: open the claw, aim/reach toward the named object, then close the claw.",
+     "parameters": {"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}},
 ]
 MOTOR_QUEUE = "st3215/inference"
 RAM_TORQUE_ENABLE, RAM_GOAL_POSITION, RAM_PRESENT_POSITION = 0x28, 0x2A, 0x38
@@ -320,49 +334,129 @@ async def _locate(target: str):
     return None, None
 
 
-async def _servo_to(target: str) -> str:
-    """Closed-loop visual servo: nudge joints to bring `target` to frame center.
+async def _locate_box(target: str):
+    """Find `target` -> (cx, cy, size_fraction) in 0-1000 / 0..1, or None.
 
-    Eye-in-hand, uncalibrated: the per-joint direction (sign) is unknown, so we
-    learn it online — if a move makes the object MORE off-center, we step back,
-    flip that joint's direction, and damp the gain. Repeats until centered.
+    size_fraction (bounding-box area / frame) is the distance proxy: bigger = closer.
     """
-    axes = [("pan", S.base_motor, "x")]
-    if S.tilt_motor:
-        axes.append(("tilt", S.tilt_motor, "y"))
-    sign = {n: 1 for n, _, _ in axes}
-    gain = {n: SERVO_GAIN for n, _, _ in axes}
-    prev_abs = {n: None for n, _, _ in axes}
-    prev_pos = {n: None for n, _, _ in axes}
+    img = _frame_pil()
+    prompt = (f'Find the {target}. Return ONLY JSON: a bounding box [{{"box_2d":[ymin,xmin,ymax,xmax]}}] '
+              f'if you can see it clearly, otherwise a point [{{"point":[y,x]}}]. Normalized 0-1000. '
+              f'If absent, return [].')
+    cfg = types.GenerateContentConfig(temperature=0.0,
+                                      thinking_config=types.ThinkingConfig(thinking_budget=0))
+    try:
+        resp = await asyncio.to_thread(S.gemini.models.generate_content,
+                                       model=SERVO_MODEL, contents=[img, prompt], config=cfg)
+        t = resp.text or ""
+        # box (4 numbers) -> center + size; else point (2 numbers) -> center, size unknown
+        mb = re.search(r"\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]", t)
+        if mb:
+            ymin, xmin, ymax, xmax = (float(mb.group(k)) for k in range(1, 5))
+            size = max(0.0, ymax - ymin) * max(0.0, xmax - xmin) / 1.0e6
+            return (xmin + xmax) / 2.0, (ymin + ymax) / 2.0, size
+        mp = re.search(r"\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]", t)
+        if mp:
+            y, x = float(mp.group(1)), float(mp.group(2))
+            return x, y, None  # point: center known, size unknown
+    except Exception:
+        logger.exception("locate failed")
+    return None
+
+
+def _servo_joints() -> list[int]:
+    """Servos to drive while reaching. Default = every joint except the gripper.
+    Override with SERVO_JOINTS=1,2,3,...  (GRIPPER_MOTOR defaults to the highest id)."""
+    motors = list(_motors())
+    env = os.getenv("SERVO_JOINTS", "").strip()
+    if env:
+        want = [int(x) for x in env.split(",")]
+        return [j for j in want if j in motors]
+    return [j for j in motors if j != _gripper_id()]
+
+
+def _gripper_id() -> int:
+    motors = list(_motors())
+    return int(os.getenv("GRIPPER_MOTOR", str(max(motors)))) if motors else 0
+
+
+async def _set_gripper(open_it: bool) -> str:
     await _torque(True)
-    log = []
+    g = _gripper_id()
+    await _move_norm({g: GRIPPER_OPEN if open_it else GRIPPER_CLOSE})
+    return f"claw {'opened' if open_it else 'closed'} (M{g})"
+
+
+async def _servo_to(target: str) -> str:
+    """Two-brain visual servo: ER 1.6 is the vision brain, the arm is driven slowly.
+
+    Phase 1 (center): move joints to bring `target` to the MIDDLE of the frame.
+    Phase 2 (reach):  only once it's roughly centered, extend toward it (grow its size).
+    Each step ER 1.6 locates the target; we nudge one joint a small, shrinking step,
+    then verify on the next frame: worse -> step back + reverse; no effect -> freeze
+    that joint (this is what kills the random drift); better -> keep its direction.
+    """
+    active = _servo_joints()
+    if not active:
+        return "no servo joints available"
+    sign = {j: 1 for j in active}
+    gain = {j: SERVO_GAIN for j in active}
+    frozen: set[int] = set()
+    prev_pos: dict[int, float] = {}
+    prev_cost = None
+    last_j = None
+    phase = "center"
+    qi = 0
+    await _torque(True)
+    log = [f"two-brain servo (ER 1.6 vision) joints {active} -> '{target}'"]
     for i in range(SERVO_MAX_ITERS):
-        ty, tx = await _locate(target)
-        if ty is None:
-            log.append(f"step {i}: lost sight of '{target}'")
+        box = await _locate_box(target)
+        if box is None:
+            log.append(f"{i}: target not in view")
+            continue
+        cx, cy, size = box
+        have_size = size is not None
+        cdist = math.hypot(cx - 500.0, cy - 500.0)
+        # phase transitions with hysteresis (reach only when ER gives a box = a size)
+        if phase == "center" and cdist < CENTER_OK and have_size:
+            phase = "reach"; frozen.clear(); gain = {j: SERVO_GAIN for j in active}; prev_cost = None; last_j = None
+            log.append("  in the middle — reaching")
+        elif phase == "reach" and cdist > CENTER_OK * 1.6:
+            phase = "center"; frozen.clear(); gain = {j: SERVO_GAIN for j in active}; prev_cost = None; last_j = None
+            log.append("  drifted off-center — re-centering")
+        cost = cdist / 707.0 + (REACH_WEIGHT * max(0.0, REACH_SIZE_TARGET - size) / REACH_SIZE_TARGET
+                                if (phase == "reach" and have_size) else 0.0)
+        log.append(f"{i}: c=({int(cx)},{int(cy)}) off={int(cdist)} size={(size if have_size else -1):.2f} [{phase}]")
+        if cdist < SERVO_TOL and (not have_size or size >= REACH_SIZE_TARGET):
+            log.append("aimed ✓" if not have_size else "aimed + reached ✓")
             break
-        err = {"x": tx - 500.0, "y": ty - 500.0}
-        dist = math.hypot(err["x"], err["y"] if S.tilt_motor else 0.0)
-        log.append(f"step {i}: {target}@({int(tx)},{int(ty)}) off-center={int(dist)}")
-        if dist < SERVO_TOL:
-            log.append("centered ✓")
+        # verify the previous move
+        if last_j is not None and prev_cost is not None:
+            dcost = cost - prev_cost
+            if dcost > 0.01:                       # worse -> step back + reverse + damp
+                sign[last_j] *= -1
+                gain[last_j] = max(0.03, gain[last_j] * 0.6)
+                await _move_norm({last_j: prev_pos[last_j]})
+            elif abs(dcost) < 0.01:                # no measurable effect -> freeze it
+                gain[last_j] *= 0.5
+                if gain[last_j] < 0.035:
+                    frozen.add(last_j)
+                    log.append(f"  joint {last_j}: no effect, frozen")
+        prev_cost = cost
+        avail = [j for j in active if j not in frozen]
+        if not avail:
+            log.append("converged (no joint improves it further)")
             break
-        for name, mid, k in axes:
-            e = err[k]
-            cur = _norm_of(mid)
-            # Did the previous move on this axis make things worse? Step back + flip.
-            if prev_abs[name] is not None and abs(e) > prev_abs[name] + 15:
-                sign[name] *= -1
-                gain[name] = max(0.04, gain[name] * 0.6)
-                if prev_pos[name] is not None:
-                    await _move_norm({mid: prev_pos[name]})
-                    cur = prev_pos[name]
-                    log.append(f"  {name}: overshot — stepped back, reversed direction")
-            prev_abs[name], prev_pos[name] = abs(e), cur
-            delta = max(-SERVO_MAX_STEP, min(SERVO_MAX_STEP, sign[name] * gain[name] * (e / 500.0)))
-            await _move_norm({mid: max(0.0, min(1.0, cur + delta))})
+        # nudge the next available joint; step shrinks as we get closer (slow + precise)
+        j = avail[qi % len(avail)]; qi += 1
+        cur = _norm_of(j)
+        prev_pos[j] = cur
+        last_j = j
+        scale = max(0.35, min(1.0, cost))
+        d = max(-SERVO_MAX_STEP, min(SERVO_MAX_STEP, sign[j] * gain[j] * scale))
+        await _move_norm({j: max(0.0, min(1.0, cur + d))})
         await asyncio.sleep(SERVO_SETTLE)
-    return " | ".join(log)
+    return " | ".join(log[-18:])
 
 
 async def _exec_arm(arm: dict, points: list) -> str:
@@ -388,6 +482,12 @@ async def _exec_arm(arm: dict, points: list) -> str:
 async def _run_tool(name: str, args: dict) -> str:
     """Execute one Live tool call against the arm (shared by the web WS client and live.py)."""
     try:
+        if name == "look":
+            img = _frame_pil()
+            cfg = types.GenerateContentConfig(temperature=0.4, thinking_config=types.ThinkingConfig(thinking_budget=0))
+            r = await asyncio.to_thread(S.gemini.models.generate_content, model=MODEL_ID,
+                                        contents=[img, "Briefly describe the scene and list the notable objects you see."], config=cfg)
+            return (r.text or "").strip()[:500]
         if name == "point_at":
             return await _servo_to((args.get("target") or "").strip())
         if name == "move_joint":
@@ -399,6 +499,18 @@ async def _run_tool(name: str, args: dict) -> str:
         if name == "set_torque":
             await _torque(bool(args["enable"]))
             return "torque " + ("enabled" if args["enable"] else "disabled (limp)")
+        if name == "open_gripper":
+            return await _set_gripper(True)
+        if name == "close_gripper":
+            return await _set_gripper(False)
+        if name == "grab":
+            t = (args.get("target") or "").strip()
+            if not t:
+                return "no target to grab"
+            await _set_gripper(True)        # open the claw
+            servo_log = await _servo_to(t)  # aim + reach toward it
+            await _set_gripper(False)       # close on it
+            return f"grab '{t}': {servo_log} | claw closed"
     except Exception as e:
         logger.exception("tool %s failed", name)
         return f"error: {e}"
@@ -510,6 +622,34 @@ async def api_tool(req: ToolReq):
     return {"result": await _run_tool(req.name, req.args)}
 
 
+@app.get("/api/detect")
+async def detect():
+    """ER 1.6 object detection for the live overlay: list of {box, label}."""
+    img = _frame_pil()
+    prompt = ('Detect the prominent objects in view. Return ONLY a JSON array '
+              '[{"box_2d":[ymin,xmin,ymax,xmax],"label":"<name>"}], normalized 0-1000, integers, '
+              'at most 12 objects, no masks, no code fencing.')
+    cfg = types.GenerateContentConfig(temperature=0.0, thinking_config=types.ThinkingConfig(thinking_budget=0))
+    boxes = []
+    try:
+        r = await asyncio.to_thread(S.gemini.models.generate_content, model=MODEL_ID, contents=[img, prompt], config=cfg)
+        txt = _parse_json(r.text or "")
+        a, b = txt.find("["), txt.rfind("]")
+        if a != -1 and b > a:
+            try:
+                for it in json.loads(txt[a:b + 1]):
+                    bb = it.get("box_2d")
+                    if bb and len(bb) == 4:
+                        boxes.append({"box": [int(v) for v in bb], "label": it.get("label", "")})
+            except Exception:
+                for m in re.finditer(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", txt):
+                    boxes.append({"box": [int(m.group(k)) for k in range(1, 5)], "label": ""})
+    except Exception as e:
+        logger.exception("detect failed")
+        return {"boxes": [], "error": str(e)[:120]}
+    return {"boxes": boxes[:12]}
+
+
 @app.post("/api/torque/{enable}")
 async def torque(enable: int):
     await _torque(bool(enable))
@@ -543,6 +683,11 @@ HTML = """<!doctype html><html><head><meta charset=utf-8><title>Norma Core · ER
    transform:translate(-50%,-50%);box-shadow:0 0 22px rgba(41,98,255,.7)}
  .lbl{position:absolute;background:#2962FF;color:#fff;font-size:12px;padding:2px 8px;border-radius:5px;
    transform:translate(12px,-10px);white-space:nowrap}
+ #detov{position:absolute;inset:0;pointer-events:none}
+ .dbox{position:absolute;border:2px solid #27e0a0;border-radius:4px;box-shadow:0 0 12px rgba(39,224,160,.35)}
+ .dlbl{position:absolute;top:-17px;left:-2px;background:#27e0a0;color:#04140d;font-size:11px;font-weight:600;
+   padding:1px 6px;border-radius:4px;white-space:nowrap}
+ #detbtn.on{background:#15705a;border-color:#27e0a0;color:#d6fff0}
  #ctrls{display:flex;gap:8px;flex-wrap:wrap}
  button{background:#1b1f27;color:#e7e9ec;border:1px solid #2b303b;border-radius:8px;padding:8px 12px;cursor:pointer}
  button:hover{background:#262b35}
@@ -563,8 +708,11 @@ HTML = """<!doctype html><html><head><meta charset=utf-8><title>Norma Core · ER
 </style></head><body>
 <div id=left>
  <h3>Live camera · arm view</h3>
- <div id=stage><img id=cam><div id=overlay></div></div>
+ <div id=stage><img id=cam><div id=overlay></div><div id=detov></div></div>
  <div id=ctrls>
+   <button id=detbtn onclick="detToggle()">👁 ER overlay</button>
+   <button onclick="callTool('open_gripper')">✋ Open claw</button>
+   <button onclick="callTool('close_gripper')">🤏 Close claw</button>
    <button onclick="t(0)">Torque OFF (limp)</button>
    <button onclick="t(1)">Torque ON</button>
    <button onclick="rec()">Record pose…</button>
@@ -624,6 +772,26 @@ function voiceToggle(){
 async function t(v){await fetch('/api/torque/'+v,{method:'POST'});add('act','⚙ torque '+(v?'ON':'OFF'));}
 async function rec(){const n=prompt('Pose name (e.g. left, center, right):');if(!n)return;
  await fetch('/api/record/'+encodeURIComponent(n),{method:'POST'});add('act','⚙ recorded pose "'+n+'"');}
+async function callTool(n,a){add('act','⚙ '+n);try{const r=await(await fetch('/api/tool',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:n,args:a||{}})})).json();add('act','   → '+r.result);}catch(e){add('act','⚠ '+e);}}
+// --- ER 1.6 detection overlay on the live preview ---
+const detBtn=document.getElementById('detbtn'),detov=document.getElementById('detov');
+let detOn=false,detTimer=null;
+function drawBoxes(boxes){
+ const r=cam.getBoundingClientRect(),s=detov.getBoundingClientRect(),ox=r.left-s.left,oy=r.top-s.top;
+ detov.innerHTML='';
+ (boxes||[]).forEach(b=>{const[ymin,xmin,ymax,xmax]=b.box;
+   const d=document.createElement('div');d.className='dbox';
+   d.style.left=(ox+xmin/1000*r.width)+'px';d.style.top=(oy+ymin/1000*r.height)+'px';
+   d.style.width=((xmax-xmin)/1000*r.width)+'px';d.style.height=((ymax-ymin)/1000*r.height)+'px';
+   const l=document.createElement('div');l.className='dlbl';l.textContent=b.label||'';d.appendChild(l);
+   detov.appendChild(d);});
+}
+async function detTick(){if(!detOn)return;try{const d=await (await fetch('/api/detect')).json();if(detOn)drawBoxes(d.boxes);}catch(e){}}
+function detToggle(){
+ detOn=!detOn;detBtn.classList.toggle('on',detOn);
+ if(detOn){add('act','👁 ER 1.6 overlay on');detTick();detTimer=setInterval(detTick,2200);}
+ else{if(detTimer)clearInterval(detTimer);detov.innerHTML='';add('act','👁 overlay off');}
+}
 // --- Gemini Live (raw WebSocket): native bidirectional voice + video + tools ---
 const liveBtn=document.getElementById('livebtn');
 let lws=null,liveOn=false,micCtx=null,micProc=null,micStream=null,playCtx=null,playTime=0,frameTimer=null,curBot=null,curUser=null;
@@ -644,7 +812,7 @@ async function liveToggle(){
  lws.onopen=()=>lws.send(JSON.stringify({setup:{model:'models/'+cfg.model,generationConfig:{responseModalities:['AUDIO']},systemInstruction:{parts:[{text:cfg.system}]},tools:[{functionDeclarations:cfg.decls}],inputAudioTranscription:{},outputAudioTranscription:{}}}));
  lws.onmessage=async(ev)=>{
    let d=ev.data;if(d instanceof Blob)d=await d.text();const m=JSON.parse(d);
-   if(m.setupComplete){add('act','🎙 live — talk now (headphones recommended)');startMic();startFrames();return;}
+   if(m.setupComplete){add('act','🎙 live — talk now (headphones recommended). Camera handled by ER 1.6.');startMic();return;}
    const sc=m.serverContent;
    if(sc){
      if(sc.modelTurn&&sc.modelTurn.parts)for(const p of sc.modelTurn.parts){if(p.inlineData&&p.inlineData.data)playPCM(p.inlineData.data);}
