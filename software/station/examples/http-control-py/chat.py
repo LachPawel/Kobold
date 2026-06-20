@@ -298,13 +298,28 @@ async def chat_turn(message: str) -> dict:
     prompt = f"{_system_context()}\n\nUser: {message}"
     cfg = types.GenerateContentConfig(temperature=0.4,
                                       thinking_config=types.ThinkingConfig(thinking_budget=0))
-    resp = await asyncio.to_thread(
-        S.gemini.models.generate_content, model=MODEL_ID, contents=[img, prompt], config=cfg)
+    try:
+        resp = await asyncio.to_thread(
+            S.gemini.models.generate_content, model=MODEL_ID, contents=[img, prompt], config=cfg)
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            import re
+            m = re.search(r"retry in ([\d.]+)s", msg, re.I) or re.search(r"'retryDelay': '(\d+)s'", msg)
+            wait = f" Try again in ~{int(float(m.group(1)))}s." if m else ""
+            return {"reply": f"I've hit the Gemini free-tier limit for ER 1.6 (20 requests/day)."
+                             f" Enable billing on the API key for real use.{wait}",
+                    "points": [], "action": "rate-limited (429)"}
+        logger.exception("Gemini call failed")
+        return {"reply": f"Model error: {msg[:160]}", "points": [], "action": "error"}
     try:
         data = json.loads(_parse_json(resp.text))
     except Exception:
         return {"reply": resp.text, "points": [], "action": ""}
-    action_log = await _exec_arm(data.get("arm", {}), data.get("points", []))
+    try:
+        action_log = await _exec_arm(data.get("arm", {}), data.get("points", []))
+    except Exception as e:
+        action_log = f"arm error: {str(e)[:120]}"
     return {"reply": data.get("reply", ""), "points": data.get("points", []), "action": action_log}
 
 
@@ -357,7 +372,11 @@ async def frame():
 
 @app.post("/api/chat")
 async def chat(req: ChatReq):
-    return await chat_turn(req.message)
+    try:
+        return await chat_turn(req.message)
+    except Exception as e:
+        logger.exception("chat failed")
+        return {"reply": f"Error: {str(e)[:160]}", "points": [], "action": "error"}
 
 
 @app.post("/api/torque/{enable}")
@@ -405,6 +424,10 @@ HTML = """<!doctype html><html><head><meta charset=utf-8><title>Norma Core · ER
  #bar{display:flex;gap:8px;padding:14px;border-top:1px solid #1b1f27}
  #inp{flex:1;background:#11151b;border:1px solid #2b303b;border-radius:10px;color:#fff;padding:11px 13px;font:inherit}
  h3{margin:0;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#8b93a1}
+ #micbtn,#spkbtn{font-size:18px;line-height:1;width:44px}
+ #micbtn.on{background:#c0392b;border-color:#e74c3c;animation:pulse 1.1s infinite}
+ #spkbtn.on{background:#1e7d4f;border-color:#27ae60}
+ @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(231,76,60,.55)}50%{box-shadow:0 0 0 9px rgba(231,76,60,0)}}
 </style></head><body>
 <div id=left>
  <h3>Live camera · arm view</h3>
@@ -417,7 +440,10 @@ HTML = """<!doctype html><html><head><meta charset=utf-8><title>Norma Core · ER
 </div>
 <div id=right>
  <div id=log><div class=msg bot>Hi! I can see through the arm's camera. Ask me what I see, or tell me to point at something.</div></div>
- <div id=bar><input id=inp placeholder="Ask about the scene, or 'point at the…'" autofocus>
+ <div id=bar>
+   <button id=micbtn onclick=micToggle() title="Click and speak (push to talk)">🎤</button>
+   <button id=spkbtn onclick=voiceToggle() title="Voice mode: speaks replies + keeps listening">🔊</button>
+   <input id=inp placeholder="Speak or type — e.g. 'point at the laptop'" autofocus>
    <button onclick=send()>Send</button></div>
 </div>
 <script>
@@ -434,9 +460,34 @@ function draw(points){ov.innerHTML='';const r=cam.getBoundingClientRect(),s=ov.g
  setTimeout(()=>ov.innerHTML='',6000);}
 async function send(){const m=inp.value.trim();if(!m)return;inp.value='';add('me',m);const w=add('bot','…');
  try{const r=await fetch('/api/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({message:m})});
-   const d=await r.json();w.textContent=d.reply||'(no reply)';if(d.action)add('act','⚙ '+d.action);draw(d.points);}
+   const d=await r.json();w.textContent=d.reply||'(no reply)';if(d.action)add('act','⚙ '+d.action);draw(d.points);
+   if(voiceMode)speak(d.reply);}
  catch(e){w.textContent='Error: '+e;}}
 inp.addEventListener('keydown',e=>{if(e.key==='Enter')send();});
+// --- Voice: speech-to-text (mic) + text-to-speech (replies) ---
+const micBtn=document.getElementById('micbtn'),spkBtn=document.getElementById('spkbtn');
+let recog=null,listening=false,voiceMode=false;
+function micToggle(){
+ const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+ if(!SR){add('act','⚠ no speech recognition in this browser — use Chrome or Edge');return;}
+ if(listening){recog.stop();return;}
+ recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.continuous=false;
+ recog.onstart=()=>{listening=true;micBtn.classList.add('on');};
+ recog.onend=()=>{listening=false;micBtn.classList.remove('on');};
+ recog.onerror=e=>{listening=false;micBtn.classList.remove('on');if(e.error!=='no-speech'&&e.error!=='aborted')add('act','⚠ mic: '+e.error);};
+ recog.onresult=e=>{let t='';for(const r of e.results)t+=r[0].transcript;inp.value=t;
+   if(e.results[e.results.length-1].isFinal){recog.stop();send();}};
+ recog.start();}
+function speak(text){
+ if(!text||!window.speechSynthesis)return;
+ speechSynthesis.cancel();
+ const u=new SpeechSynthesisUtterance(text);u.lang='en-US';u.rate=1.05;
+ u.onend=()=>{if(voiceMode&&!listening)setTimeout(micToggle,300);};  // hands-free: listen again
+ speechSynthesis.speak(u);}
+function voiceToggle(){
+ voiceMode=!voiceMode;spkBtn.classList.toggle('on',voiceMode);
+ add('act','🔊 voice mode '+(voiceMode?'ON — talk, it replies aloud and keeps listening':'OFF'));
+ if(voiceMode&&!listening)micToggle();}
 async function t(v){await fetch('/api/torque/'+v,{method:'POST'});add('act','⚙ torque '+(v?'ON':'OFF'));}
 async function rec(){const n=prompt('Pose name (e.g. left, center, right):');if(!n)return;
  await fetch('/api/record/'+encodeURIComponent(n),{method:'POST'});add('act','⚙ recorded pose "'+n+'"');}
