@@ -1,0 +1,15 @@
+[project]
+name = "norma-er-chat"
+version = "0.1.0"
+description = "Text chat + live camera + arm control for NormaCore via Gemini Robotics-ER 1.6"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "google-genai",
+    "pillow",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+webcam = ["opencv-python"]

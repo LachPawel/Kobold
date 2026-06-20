@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+google-genai
+pillow
+python-dotenv
+# opencv-python   # uncomment only if you want the local-webcam fallback

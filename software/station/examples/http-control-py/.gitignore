@@ -1,0 +1,4 @@
+.env
+poses.json
+__pycache__/
+*.pyc
