@@ -58,16 +58,15 @@ logger = logging.getLogger("chat")
 MODEL_ID = "gemini-robotics-er-1.6-preview"
 LOCATE_MODEL = os.getenv("LOCATE_MODEL", "gemini-2.5-flash")  # fast model used inside the servo loop
 SERVO_MODEL = os.getenv("SERVO_MODEL", "gemini-robotics-er-1.6-preview")  # ER 1.6 = the vision brain
-SERVO_TOL = 70           # off-center distance (0-1000) = "aimed at it"
-CENTER_OK = 150          # "roughly in the middle" — center to here before reaching
-SERVO_MAX_ITERS = 28     # longer loop
-SERVO_GAIN = 0.08        # smaller = slower, smoother (was 0.13)
-SERVO_MAX_STEP = 0.06    # cap on a single iteration's joint move (normalized)
-SERVO_SETTLE = 0.7       # seconds to let the servo move + camera refresh between checks
-REACH_WEIGHT = 0.7       # how much "get closer" (grow on-screen size) matters vs centering
-REACH_SIZE_TARGET = 0.18 # stop once the target fills ~18% of the frame (close enough)
-GRIPPER_OPEN = float(os.getenv("GRIPPER_OPEN", "0.0"))   # normalized claw-open position (flip if reversed)
-GRIPPER_CLOSE = float(os.getenv("GRIPPER_CLOSE", "1.0"))  # normalized claw-closed position
+CAMERA_MODE = os.getenv("CAMERA_MODE", "static")  # 'static' = fixed camera above the arm (eye-to-hand); 'hand' = on the arm
+GRIPPER_QUERY = os.getenv("GRIPPER_QUERY", "the robot arm gripper claw")
+SERVO_TOL = 75           # tracked-point vs goal distance (0-1000) that counts as "on target"
+SERVO_MAX_ITERS = 34     # keep verifying often
+SERVO_GAIN = 0.10        # moderate: bigger moves so it actually extends (not too big)
+SERVO_MAX_STEP = 0.07    # hard cap on a single iteration's joint move (normalized)
+SERVO_SETTLE = 0.7       # seconds to let the servo settle + camera refresh between checks
+GRIPPER_OPEN = float(os.getenv("GRIPPER_OPEN", "1.0"))   # claw-open  (flipped — open/close was inverted)
+GRIPPER_CLOSE = float(os.getenv("GRIPPER_CLOSE", "0.0"))  # claw-closed
 # Gemini Live (browser WebSocket voice agent)
 LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.1-flash-live-preview")
 LIVE_SYSTEM = (
@@ -388,13 +387,15 @@ async def _set_gripper(open_it: bool) -> str:
 
 
 async def _servo_to(target: str) -> str:
-    """Two-brain visual servo: ER 1.6 is the vision brain, the arm is driven slowly.
+    """Cautious closed-loop visual servo (ER 1.6 vision). Two camera modes:
 
-    Phase 1 (center): move joints to bring `target` to the MIDDLE of the frame.
-    Phase 2 (reach):  only once it's roughly centered, extend toward it (grow its size).
-    Each step ER 1.6 locates the target; we nudge one joint a small, shrinking step,
-    then verify on the next frame: worse -> step back + reverse; no effect -> freeze
-    that joint (this is what kills the random drift); better -> keep its direction.
+    static (camera fixed above the arm, eye-to-hand): track the GRIPPER in the image
+      and drive it onto the TARGET's pixel. error = target_pixel - gripper_pixel.
+    hand   (camera on the arm, eye-in-hand): drive the TARGET to the frame center.
+
+    Coordinate descent over every non-gripper joint: nudge one joint a small step,
+    verify on the next frame, step back + reverse if worse, freeze joints with no
+    effect (kills random drift). Small steps + long settle = cautious motion.
     """
     active = _servo_joints()
     if not active:
@@ -405,41 +406,45 @@ async def _servo_to(target: str) -> str:
     prev_pos: dict[int, float] = {}
     prev_cost = None
     last_j = None
-    phase = "center"
     qi = 0
+    goal = None  # static mode: the (fixed) target pixel, refreshed occasionally
     await _torque(True)
-    log = [f"two-brain servo (ER 1.6 vision) joints {active} -> '{target}'"]
+    log = [f"servo [{CAMERA_MODE} cam] joints {active} -> '{target}'"]
     for i in range(SERVO_MAX_ITERS):
-        box = await _locate_box(target)
-        if box is None:
-            log.append(f"{i}: target not in view")
-            continue
-        cx, cy, size = box
-        have_size = size is not None
-        cdist = math.hypot(cx - 500.0, cy - 500.0)
-        # phase transitions with hysteresis (reach only when ER gives a box = a size)
-        if phase == "center" and cdist < CENTER_OK and have_size:
-            phase = "reach"; frozen.clear(); gain = {j: SERVO_GAIN for j in active}; prev_cost = None; last_j = None
-            log.append("  in the middle — reaching")
-        elif phase == "reach" and cdist > CENTER_OK * 1.6:
-            phase = "center"; frozen.clear(); gain = {j: SERVO_GAIN for j in active}; prev_cost = None; last_j = None
-            log.append("  drifted off-center — re-centering")
-        cost = cdist / 707.0 + (REACH_WEIGHT * max(0.0, REACH_SIZE_TARGET - size) / REACH_SIZE_TARGET
-                                if (phase == "reach" and have_size) else 0.0)
-        log.append(f"{i}: c=({int(cx)},{int(cy)}) off={int(cdist)} size={(size if have_size else -1):.2f} [{phase}]")
-        if cdist < SERVO_TOL and (not have_size or size >= REACH_SIZE_TARGET):
-            log.append("aimed ✓" if not have_size else "aimed + reached ✓")
+        if CAMERA_MODE == "static":
+            if goal is None or i % 6 == 0:                 # target is fixed; refresh now and then
+                tb = await _locate_box(target)
+                if tb:
+                    goal = (tb[0], tb[1])
+            grip = await _locate_box(GRIPPER_QUERY)         # track the moving gripper
+            if goal is None:
+                log.append(f"{i}: can't see '{target}'"); continue
+            if grip is None:
+                log.append(f"{i}: can't see the gripper"); continue
+            ex, ey = goal[0] - grip[0], goal[1] - grip[1]
+            where = f"grip=({int(grip[0])},{int(grip[1])}) tgt=({int(goal[0])},{int(goal[1])})"
+        else:
+            tb = await _locate_box(target)
+            if tb is None:
+                log.append(f"{i}: target not in view"); continue
+            ex, ey = 500.0 - tb[0], 500.0 - tb[1]
+            where = f"tgt=({int(tb[0])},{int(tb[1])})"
+        err = math.hypot(ex, ey)
+        cost = err / 707.0
+        log.append(f"{i}: {where} err={int(err)}")
+        if err < SERVO_TOL:
+            log.append("on target ✓")
             break
-        # verify the previous move
+        # verify the previous joint move
         if last_j is not None and prev_cost is not None:
             dcost = cost - prev_cost
-            if dcost > 0.01:                       # worse -> step back + reverse + damp
+            if dcost > 0.012:                      # worse -> step back + reverse (keep it lively)
                 sign[last_j] *= -1
-                gain[last_j] = max(0.03, gain[last_j] * 0.6)
+                gain[last_j] = max(0.045, gain[last_j] * 0.7)
                 await _move_norm({last_j: prev_pos[last_j]})
-            elif abs(dcost) < 0.01:                # no measurable effect -> freeze it
-                gain[last_j] *= 0.5
-                if gain[last_j] < 0.035:
+            elif abs(dcost) < 0.008:               # no measurable effect -> back off slowly, freeze late
+                gain[last_j] *= 0.6
+                if gain[last_j] < 0.02:
                     frozen.add(last_j)
                     log.append(f"  joint {last_j}: no effect, frozen")
         prev_cost = cost
@@ -447,12 +452,12 @@ async def _servo_to(target: str) -> str:
         if not avail:
             log.append("converged (no joint improves it further)")
             break
-        # nudge the next available joint; step shrinks as we get closer (slow + precise)
+        # nudge the next available joint; step eases as we get close but stays meaningful
         j = avail[qi % len(avail)]; qi += 1
         cur = _norm_of(j)
         prev_pos[j] = cur
         last_j = j
-        scale = max(0.35, min(1.0, cost))
+        scale = max(0.55, min(1.0, cost))
         d = max(-SERVO_MAX_STEP, min(SERVO_MAX_STEP, sign[j] * gain[j] * scale))
         await _move_norm({j: max(0.0, min(1.0, cur + d))})
         await asyncio.sleep(SERVO_SETTLE)
