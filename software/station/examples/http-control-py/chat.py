@@ -70,30 +70,29 @@ GRIPPER_CLOSE = float(os.getenv("GRIPPER_CLOSE", "0.0"))  # claw-closed
 # Gemini Live (browser WebSocket voice agent)
 LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.1-flash-live-preview")
 LIVE_SYSTEM = (
-    "You are the voice of a NormaCore robot arm. You do NOT see the camera directly — the robot's vision is a "
-    "separate model (Gemini ER 1.6). To see the scene, call look(). To aim the arm at something, call "
-    "point_at(target) — it starts moving and returns immediately, so you can KEEP LISTENING and correct it "
-    "WHILE it moves: if the user names a different object call retarget(target) (or point_at again); if they say "
-    "'a bit left/right/up/down' call nudge(direction); if they say 'stop' call stop. To pick something up call "
-    "grab(target) (opens the claw, reaches, closes); open_gripper/close_gripper control the claw directly. Use "
-    "move_joint for direct joint moves, replay_pose for saved poses, set_torque to limp/stiffen the arm. "
-    "Keep spoken replies short and conversational; narrate what you're doing, and react fast to corrections."
+    "You are the brain of a NormaCore robot arm, and you SEE its camera feed live (often two views merged side by side). "
+    "YOU drive the arm directly with move_joint_delta(motor_id, delta): nudge a joint, watch the NEXT frame, iterate. "
+    "JOINT ROLES — use them: M1 = rotate the whole arm left/right (base yaw); M2 = SHOULDER, the BIG reach that swings "
+    "the arm forward/back and up/down; M3 = elbow; M4 = forearm extend; M5 & M6 = wrist angle; M7 = wrist twist; M8 = gripper. "
+    "For GROSS positioning, lead with M1 (turn toward the target) and M2 (reach/raise toward it) — they move the arm the "
+    "most. Then M3/M4 to extend. Use M5-M7 ONLY to fine-tune the gripper angle. Do NOT get stuck only nudging M3-M6. "
+    "Use the FULL range of motion: deltas up to ~0.12 (bigger on M1/M2 for large moves, smaller for fine work) — don't "
+    "make only tiny middle-of-range moves. Reach in 3D: left/right via M1; forward/back & up/down via M2 then M3/M4. "
+    "ALWAYS start a new reach from the safe HOME pose: call go_home first, then move from there. "
+    "Use the TOP-DOWN camera as your MAIN reference for the gripper-vs-target offset (left/right + forward/back); use the "
+    "other view for up/down. If you canNOT see the target, sweep M1/M2 to look around until it's in frame, then approach. "
+    "Iterate until the gripper reaches the target, then stop. open_gripper/close_gripper for the claw, grab to close on an "
+    "object, go_home to reset, arm_state to read joint values. Keep spoken replies short; briefly narrate as you move."
 )
 FUNC_DECLS = [
-    {"name": "look", "description": "Look through the robot's camera (Gemini ER 1.6) and describe what is visible. Call whenever the user asks what you see or to find/identify something.",
-     "parameters": {"type": "object", "properties": {}}},
-    {"name": "point_at", "description": "Start aiming the arm at a named object (closed-loop visual servo). Returns immediately and keeps moving in the background so you can correct it mid-motion.",
-     "parameters": {"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}},
-    {"name": "retarget", "description": "While the arm is already moving, switch what it's aiming at (e.g. user says 'no, the red one').",
-     "parameters": {"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}},
-    {"name": "nudge", "description": "Nudge the current aim a bit in a direction: 'left', 'right', 'up', or 'down' (user says 'a little left').",
-     "parameters": {"type": "object", "properties": {"direction": {"type": "string"}}, "required": ["direction"]}},
-    {"name": "stop", "description": "Stop the arm's current motion immediately (user says 'stop').",
-     "parameters": {"type": "object", "properties": {}}},
-    {"name": "move_joint", "description": "Move one joint to a normalized position (0=range min, 1=range max).",
+    {"name": "move_joint_delta", "description": "Nudge ONE joint by a small RELATIVE amount (delta -0.1..0.1 of its range, + or -). Your main control: nudge, watch the camera, repeat. The gripper is motor 8.",
+     "parameters": {"type": "object", "properties": {"motor_id": {"type": "integer"}, "delta": {"type": "number"}}, "required": ["motor_id", "delta"]}},
+    {"name": "move_joint", "description": "Set one joint to an ABSOLUTE normalized position (0=range min, 1=range max).",
      "parameters": {"type": "object", "properties": {"motor_id": {"type": "integer"}, "normalized": {"type": "number"}}, "required": ["motor_id", "normalized"]}},
-    {"name": "replay_pose", "description": "Move the arm to a saved pose by name.",
-     "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "arm_state", "description": "Read current joint positions (normalized 0..1) for all motors.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "look", "description": "Describe what is currently visible in the camera (you also see it live, but this gives a careful description).",
+     "parameters": {"type": "object", "properties": {}}},
     {"name": "set_torque", "description": "Enable (stiffen) or disable (limp) the arm motors.",
      "parameters": {"type": "object", "properties": {"enable": {"type": "boolean"}}, "required": ["enable"]}},
     {"name": "go_home", "description": "Return the arm to its home/rest position.", "parameters": {"type": "object", "properties": {}}},
@@ -107,6 +106,7 @@ RAM_TORQUE_ENABLE, RAM_GOAL_POSITION, RAM_PRESENT_POSITION = 0x28, 0x2A, 0x38
 MAX_STEP, SIGN_BIT = 4095, 0x8000
 POSES_PATH = _HERE.parent / "poses.json"
 HOME_TICKS = {1: 2100, 2: 2022, 3: 2049, 4: 2065, 5: 2128, 6: 2035, 7: 1981, 8: 1981}  # raw-tick "home" pose
+CALIB_PATH = _HERE.parent / "calib.json"   # taught references: [{point:[x,y], ticks:{motor:tick}}]
 
 
 def _u16(b: bytes, a: int) -> int:
@@ -132,6 +132,7 @@ class S:
     jpeg: bytes | None = None
     jpeg2: bytes | None = None
     video_tasks: dict = {}   # slot -> asyncio.Task (so we can rebind cameras live)
+    llm_src = "0"            # which camera(s) the LLM reasons over: "0", "1", or "merged"
     gemini = None
     # steerable background servo — lets you correct point_at mid-motion by voice
     servo_target = ""
@@ -299,22 +300,24 @@ async def _probe_live(queue: str, timeout: float = 3.0) -> bool:
 
 
 async def _autobind():
-    """If the configured primary camera is dark a few seconds in, auto-bind the
-    first camera that's actually streaming. Keeps the preview alive when a USB
-    re-enumeration (e.g. plugging in the D455) changes camera ids."""
+    """A few seconds in, find the cameras that are actually streaming and bind them to
+    slots 1 & 2 if the configured ones are dark. USB re-enumeration renames camera queue
+    ids on every replug, so this keeps both cameras working without editing .env."""
     await asyncio.sleep(4.0)
-    if S.jpeg is not None:
-        return  # primary already streaming
-    for q in _discover_cameras():
-        if q == S.video_queue:
-            continue
-        try:
-            if await _probe_live(q):
-                logger.warning("primary camera dark — auto-binding live camera %s", q)
-                await _rebind_camera(0, q)
-                return
-        except Exception:
-            pass
+    cams = _discover_cameras()
+    if not cams:
+        return
+    results = await asyncio.gather(*[_probe_live(q, 2.5) for q in cams], return_exceptions=True)
+    live = [q for q, ok in zip(cams, results) if ok is True]
+    if not live:
+        return
+    if S.jpeg is None:                       # primary dark -> bind first live camera
+        logger.warning("primary camera dark — auto-binding %s", live[0])
+        await _rebind_camera(0, live[0])
+    others = [q for q in live if q != S.video_queue]
+    if S.jpeg2 is None and others:           # 2nd dark but another live cam exists -> bind it
+        logger.warning("2nd camera dark — auto-binding %s", others[0])
+        await _rebind_camera(1, others[0])
 
 
 async def _rebind_camera(slot: int, queue: str):
@@ -402,8 +405,17 @@ def _composite() -> Image.Image:
 
 
 def _frame_pil() -> Image.Image:
-    """Default view sent to the LLM and shown in the preview = the merged composite."""
-    return _composite()
+    """What the LLM (look/detect/chat) reasons over — follows the selected mode:
+    "0"/"1" = a single camera (fast, no merge); "merged" = both cameras side-by-side."""
+    if S.llm_src == "1":
+        f = _one_frame(1) or _one_frame(0)
+        if f is not None:
+            return f
+    elif S.llm_src != "merged":          # "0" (default): single primary camera
+        f = _one_frame(0)
+        if f is not None:
+            return f
+    return _composite()                  # "merged" (or fallback): both cameras
 
 
 # --- Gemini ER chat ---------------------------------------------------------
@@ -458,11 +470,12 @@ async def _locate(target: str):
     return None, None
 
 
-async def _locate_box(target: str, slot: int = 0):
+async def _locate_box(target: str, slot: int = 0, model: str | None = None):
     """Find `target` -> (cx, cy, size_fraction) in 0-1000 / 0..1, or None.
 
     Uses ONE camera (slot 0 = overhead, 1 = wrist) so coordinates stay unambiguous
-    for the servo. size_fraction (box area / frame) is the distance proxy: bigger = closer.
+    for the servo. `model` overrides the vision model (default SERVO_MODEL = ER 1.6;
+    pass LOCATE_MODEL = gemini-2.5-flash for fast, frequent reads like gripper tracking).
     """
     img = _one_frame(slot)
     if img is None:
@@ -474,7 +487,7 @@ async def _locate_box(target: str, slot: int = 0):
                                       thinking_config=types.ThinkingConfig(thinking_budget=0))
     try:
         resp = await asyncio.to_thread(S.gemini.models.generate_content,
-                                       model=SERVO_MODEL, contents=[img, prompt], config=cfg)
+                                       model=(model or SERVO_MODEL), contents=[img, prompt], config=cfg)
         t = resp.text or ""
         # box (4 numbers) -> center + size; else point (2 numbers) -> center, size unknown
         mb = re.search(r"\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]", t)
@@ -507,19 +520,57 @@ def _gripper_id() -> int:
     return int(os.getenv("GRIPPER_MOTOR", str(max(motors)))) if motors else 0
 
 
-async def _go_home() -> str:
-    """Move every joint to the saved home (entry) pose, in raw ticks (clamped to range)."""
-    await _stop_servo()
+async def _move_ticks(goals: dict) -> None:
+    """Move motors to absolute raw ticks (clamped to each calibrated range)."""
     await _torque(True)
     ms = _motors()
     writes = []
-    for mid, tick in HOME_TICKS.items():
+    for mid, tick in goals.items():
+        mid = int(mid)
         if mid in ms:
             rmin, rmax = int(ms[mid].get_range_min()), int(ms[mid].get_range_max())
             lo, hi = min(rmin, rmax), max(rmin, rmax)
             writes.append((mid, max(lo, min(hi, int(tick))).to_bytes(2, "little")))
     if writes:
         await send_commands(S.client, [_sync(RAM_GOAL_POSITION, writes)])
+
+
+def _present_ticks() -> dict:
+    return {mid: _present(bytes(m.get_state())) for mid, m in _motors().items()}
+
+
+def _load_calib() -> list:
+    try:
+        return json.loads(CALIB_PATH.read_text()) if CALIB_PATH.exists() else []
+    except Exception:
+        return []
+
+
+async def _point_calibrated(target: str) -> str:
+    """Reliable pointing by taught references: locate target, then move to the
+    inverse-distance-weighted blend of the nearest taught poses. No noisy closed loop."""
+    cal = _load_calib()
+    if len(cal) < 2:
+        return None  # not enough references -> caller falls back to the servo
+    box = await _locate_box(target, model=LOCATE_MODEL)
+    if box is None:
+        return f"can't see {target}"
+    tx, ty = box[0], box[1]
+    near = sorted(cal, key=lambda c: (c["point"][0] - tx) ** 2 + (c["point"][1] - ty) ** 2)[:3]
+    weights = [1.0 / (((c["point"][0] - tx) ** 2 + (c["point"][1] - ty) ** 2) + 1.0) for c in near]
+    goals = {}
+    for mid in _motors():
+        pairs = [(c["ticks"].get(str(mid)), w) for c, w in zip(near, weights) if c["ticks"].get(str(mid)) is not None]
+        if pairs:
+            goals[mid] = int(sum(v * w for v, w in pairs) / sum(w for _, w in pairs))
+    await _move_ticks(goals)
+    return f"pointed at {target} using {len(near)} taught references"
+
+
+async def _go_home() -> str:
+    """Move every joint to the saved home (entry) pose, in raw ticks (clamped to range)."""
+    await _stop_servo()
+    await _move_ticks(HOME_TICKS)
     return "moved to home position"
 
 
@@ -562,7 +613,7 @@ async def _servo_loop():
                 tb = await _locate_box(cur_target)
                 if tb:
                     goal = tb[:2] if goal is None else (0.5 * tb[0] + 0.5 * goal[0], 0.5 * tb[1] + 0.5 * goal[1])
-            tg = await _locate_box(GRIPPER_QUERY)
+            tg = await _locate_box(GRIPPER_QUERY, model=LOCATE_MODEL)   # fast 2.5-flash for frequent gripper reads
             if tg is not None:                             # EMA-smooth the noisy gripper reads -> smooth motion
                 grip = tg[:2] if grip is None else (0.6 * tg[0] + 0.4 * grip[0], 0.6 * tg[1] + 0.4 * grip[1])
             if goal is None:
@@ -674,7 +725,11 @@ async def _run_tool(name: str, args: dict) -> str:
                                         contents=[img, "Briefly describe the scene and list the notable objects you see."], config=cfg)
             return (r.text or "").strip()[:500]
         if name == "point_at" or name == "retarget":
-            return await _start_servo(args.get("target") or "")     # non-blocking, voice-steerable
+            target = (args.get("target") or "").strip()
+            done = await _point_calibrated(target)   # reliable taught-reference replay (if calibrated)
+            if done is not None:
+                return done
+            return await _start_servo(target)        # else fall back to the closed-loop servo
         if name == "stop":
             return await _stop_servo()
         if name == "nudge":
@@ -687,6 +742,15 @@ async def _run_tool(name: str, args: dict) -> str:
             elif "down" in d or "back" in d: by += step
             S.servo_bias = (bx, by)
             return f"nudging {d or 'nowhere'} (bias now {int(bx)},{int(by)})"
+        if name == "move_joint_delta":
+            await _torque(True)
+            mid = int(args["motor_id"]); delta = float(args["delta"])
+            cur = _norm_of(mid)
+            nxt = max(0.0, min(1.0, cur + delta))
+            await _move_norm({mid: nxt})
+            return f"joint {mid}: {cur:.2f} -> {nxt:.2f}"
+        if name == "arm_state":
+            return json.dumps({str(mid): round(_norm_of(mid), 2) for mid in _motors()})
         if name == "move_joint":
             await _torque(True)
             return f"moved joint {args['motor_id']} -> {await _move_norm({int(args['motor_id']): float(args['normalized'])})}"
@@ -832,6 +896,39 @@ async def cameras():
 @app.post("/api/setcam")
 async def setcam(req: CamReq):
     return await _rebind_camera(req.slot, req.queue)
+
+
+@app.post("/api/view/{src}")
+async def set_view(src: str):
+    """Pick which camera(s) the LLM reasons over: '0', '1', or 'merged' (both)."""
+    S.llm_src = src if src in ("0", "1", "merged") else "0"
+    return {"llm_src": S.llm_src}
+
+
+class CalibReq(BaseModel):
+    x: float
+    y: float
+
+
+@app.get("/api/calib")
+async def calib_list():
+    return {"refs": _load_calib()}
+
+
+@app.post("/api/calib")
+async def calib_add(req: CalibReq):
+    """Teach a reference: pair the clicked image point [x,y] (0-1000) with the arm's
+    CURRENT joint pose (limp the arm and hand-point it first). Records present ticks."""
+    cal = _load_calib()
+    cal.append({"point": [req.x, req.y], "ticks": {str(k): v for k, v in _present_ticks().items()}})
+    CALIB_PATH.write_text(json.dumps(cal, indent=2))
+    return {"count": len(cal), "refs": cal}
+
+
+@app.post("/api/calib/clear")
+async def calib_clear():
+    CALIB_PATH.write_text("[]")
+    return {"count": 0}
 
 
 @app.post("/api/chat")
@@ -1018,6 +1115,8 @@ HTML = """<!doctype html><html><head><meta charset=utf-8><title>Kobold · robot 
      <button class=chip id=vboth onclick="setView('merged')">Both</button>
      <button class=chip id=vtop onclick="setView('0')">1</button>
      <button class=chip id=vwrist onclick="setView('1')">2</button>
+     <button class=chip id=teachbtn onclick="teachToggle()" title="Teach a reference: limp the arm, point it at a spot, click that spot">Teach</button>
+     <button class=chip onclick="clearRefs()" title="Clear taught references">Clear refs</button>
    </span>
  </div>
  <div id=stage><img id=cam><div id=overlay></div><div id=detov></div></div>
@@ -1049,11 +1148,17 @@ function setStatus(cls,txt){statusEl.className='badge'+(cls?' '+cls:'');statusEl
 (async()=>{try{const h=await(await fetch('/api/health')).json();setStatus(h.motor_frame?'':'err',h.motor_frame?('Connected · '+(h.bus||'arm')):'No robot');}catch(e){setStatus('err','Offline');}})();
 let previewSrc='merged';
 function refresh(){cam.src='/api/frame.jpg?src='+previewSrc+'&t='+Date.now();}
-function setView(s){previewSrc=s;['vboth','vtop','vwrist'].forEach(id=>{const b=document.getElementById(id);if(b)b.classList.toggle('on',({merged:'vboth','0':'vtop','1':'vwrist'})[s]===id);});refresh();}
+function setView(s){previewSrc=s;['vboth','vtop','vwrist'].forEach(id=>{const b=document.getElementById(id);if(b)b.classList.toggle('on',({merged:'vboth','0':'vtop','1':'vwrist'})[s]===id);});fetch('/api/view/'+s,{method:'POST'}).catch(()=>{});refresh();}
 async function loadCams(){try{const d=await(await fetch('/api/cameras')).json();const sel=document.getElementById('camsel');sel.innerHTML='';(d.cameras||[]).forEach(c=>{const o=document.createElement('option');const tag=c.slot===0?'[1] ':c.slot===1?'[2] ':'    ';o.value=c.queue;o.textContent=tag+c.queue.replace('usbvideo/','').slice(0,10)+(c.has_frame?' ✓':'');o.selected=c.queue===d.slot0;sel.appendChild(o);});}catch(e){add('act','!cameras: '+e);}}
 async function pickCam(slot){const q=document.getElementById('camsel').value;if(!q)return;add('act','cam:cam → slot '+(slot+1)+' ('+q.slice(-6)+')');try{await fetch('/api/setcam',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({slot:slot,queue:q})});setTimeout(refresh,400);setTimeout(loadCams,700);}catch(e){add('act','!'+e);}}
 cam.onload=()=>setTimeout(refresh,250); cam.onerror=()=>setTimeout(refresh,1000);
 setView('0'); loadCams();   // default to the single primary camera (most setups have one)
+// --- Teach mode: limp the arm, point it at a spot, click that spot to save a reference pose ---
+let teachMode=false;
+function teachToggle(){teachMode=!teachMode;document.getElementById('teachbtn').classList.toggle('on',teachMode);cam.style.cursor=teachMode?'crosshair':'';add('act',teachMode?'teach mode ON — limp the arm (Torque off), hand-point it at a spot, then CLICK that spot on the camera':'teach mode off');if(teachMode)drawRefs();}
+async function drawRefs(){try{const d=await(await fetch('/api/calib')).json();ov.innerHTML='';const rc=cam.getBoundingClientRect(),sc=ov.getBoundingClientRect();(d.refs||[]).forEach((r,i)=>{const[rx,ry]=r.point;const dot=document.createElement('div');dot.className='pt';dot.style.background='#F4B942';dot.style.left=((rc.left-sc.left)+rx/1000*rc.width)+'px';dot.style.top=((rc.top-sc.top)+ry/1000*rc.height)+'px';const l=document.createElement('div');l.className='lbl';l.style.background='#F4B942';l.style.color='#1a1505';l.textContent='ref '+(i+1);dot.appendChild(l);ov.appendChild(dot);});}catch(e){}}
+cam.addEventListener('click',async(e)=>{if(!teachMode)return;const r=cam.getBoundingClientRect();const x=Math.round((e.clientX-r.left)/r.width*1000),y=Math.round((e.clientY-r.top)/r.height*1000);try{const d=await(await fetch('/api/calib',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({x,y})})).json();add('act','taught ref '+d.count+' at ['+x+','+y+']');drawRefs();}catch(err){add('act','! teach: '+err);}});
+async function clearRefs(){await fetch('/api/calib/clear',{method:'POST'});ov.innerHTML='';add('act','cleared taught references');}
 function add(c,txt){const d=document.createElement('div');d.className='msg '+c;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
 function draw(points){ov.innerHTML='';const r=cam.getBoundingClientRect(),s=ov.getBoundingClientRect();
  const ox=r.left-s.left,oy=r.top-s.top;
@@ -1135,7 +1240,7 @@ async function liveToggle(){
  lws.onopen=()=>lws.send(JSON.stringify({setup:{model:'models/'+cfg.model,generationConfig:{responseModalities:['AUDIO']},systemInstruction:{parts:[{text:cfg.system}]},tools:[{functionDeclarations:cfg.decls}],inputAudioTranscription:{},outputAudioTranscription:{}}}));
  lws.onmessage=async(ev)=>{
    let d=ev.data;if(d instanceof Blob)d=await d.text();const m=JSON.parse(d);
-   if(m.setupComplete){setStatus('live','Live · listening');add('act','live — talk now (headphones recommended). Camera handled by ER 1.6.');startMic();return;}
+   if(m.setupComplete){setStatus('live','Live · listening');add('act','live — talk now (headphones recommended). 3.1 sees the camera and drives the arm.');startMic();startFrames();return;}
    const sc=m.serverContent;
    if(sc){
      if(sc.modelTurn&&sc.modelTurn.parts)for(const p of sc.modelTurn.parts){if(p.inlineData&&p.inlineData.data)playPCM(p.inlineData.data);}
@@ -1184,9 +1289,9 @@ function sendF32(f){
 function startFrames(){
  frameTimer=setInterval(async()=>{
    if(!lws||lws.readyState!==1)return;
-   try{const ab=await (await fetch('/api/frame.jpg?t='+Date.now())).arrayBuffer();
+   try{const ab=await (await fetch('/api/frame.jpg?src=merged&t='+Date.now())).arrayBuffer();  // both cameras -> 3.1
      lws.send(JSON.stringify({realtimeInput:{video:{data:b64FromBytes(new Uint8Array(ab)),mimeType:'image/jpeg'}}}));}catch(e){}
- },1500);
+ },1000);   // ~1 FPS so 3.1 sees the result of each move
 }
 function stopLive(){
  liveOn=false;liveBtn.classList.remove('on');setStatus('','Connected');add('act','live off');
