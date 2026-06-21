@@ -2,3 +2,5 @@
 poses.json
 __pycache__/
 *.pyc
+models/
+.venv/

@@ -10,6 +10,8 @@ dependencies = [
     "pillow",
     "python-dotenv",
     "sounddevice>=0.5.5",
+    "mcp>=1.28.0",
+    "aic-sdk>=2.4.0",
 ]
 
 [project.optional-dependencies]
